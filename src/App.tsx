@@ -34,8 +34,9 @@ function App() {
   // Keep import queue summary fresh for background import UX.
   useEffect(() => {
     let cancelled = false
+    let timeoutId: number | null = null
 
-    const pollSummary = async () => {
+    const pollLoop = async () => {
       try {
         const summary = await getImportQueueSummary()
         if (!cancelled) {
@@ -45,17 +46,22 @@ function App() {
         if (!cancelled) {
           useImportQueueStore.getState().setSummary(null)
         }
+      } finally {
+        if (!cancelled) {
+          timeoutId = window.setTimeout(() => {
+            void pollLoop()
+          }, 1000)
+        }
       }
     }
 
-    void pollSummary()
-    const intervalId = window.setInterval(() => {
-      void pollSummary()
-    }, 1000)
+    void pollLoop()
 
     return () => {
       cancelled = true
-      window.clearInterval(intervalId)
+      if (timeoutId !== null) {
+        window.clearTimeout(timeoutId)
+      }
     }
   }, [])
 
