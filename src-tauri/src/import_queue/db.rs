@@ -13,6 +13,8 @@ pub struct ImportQueueDb {
 impl ImportQueueDb {
     pub fn open(path: impl AsRef<Path>) -> rusqlite::Result<Self> {
         let connection = Connection::open(path)?;
+        connection.pragma_update(None, "foreign_keys", true)?;
+
         let db = Self {
             conn: Arc::new(Mutex::new(connection)),
         };
@@ -222,22 +224,29 @@ mod tests {
 
     #[test]
     fn reopen_requeues_stale_running_jobs() {
-        let db = ImportQueueDb::open(temp_db_path("requeue")).unwrap();
-        let batch_id = db.insert_batch("/tmp/source").unwrap();
-        let job_id = db
-            .insert_job(NewImportJob {
-                batch_id,
-                source_path: "/tmp/source/a.md".into(),
-                source_name: "a.md".into(),
-                dest_path: "/tmp/project/raw/sources/a.md".into(),
-                max_attempts: 3,
-            })
-            .unwrap();
-        db.mark_job_stage(job_id, ImportJobStatus::Ingesting)
-            .unwrap();
+        let db_path = temp_db_path("requeue");
 
-        db.recover_stale_jobs().unwrap();
-        let job = db.get_job(job_id).unwrap();
+        let job_id = {
+            let db = ImportQueueDb::open(&db_path).unwrap();
+            let batch_id = db.insert_batch("/tmp/source").unwrap();
+            let job_id = db
+                .insert_job(NewImportJob {
+                    batch_id,
+                    source_path: "/tmp/source/a.md".into(),
+                    source_name: "a.md".into(),
+                    dest_path: "/tmp/project/raw/sources/a.md".into(),
+                    max_attempts: 3,
+                })
+                .unwrap();
+            db.mark_job_stage(job_id, ImportJobStatus::Ingesting)
+                .unwrap();
+            job_id
+        };
+
+        let reopened = ImportQueueDb::open(&db_path).unwrap();
+        reopened.recover_stale_jobs().unwrap();
+
+        let job = reopened.get_job(job_id).unwrap();
         assert_eq!(job.status, ImportJobStatus::Queued);
     }
 }
