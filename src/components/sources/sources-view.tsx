@@ -1,14 +1,54 @@
 import { useState, useEffect, useCallback } from "react"
 import { open } from "@tauri-apps/plugin-dialog"
-import { Plus, FileText, RefreshCw, BookOpen, Trash2 } from "lucide-react"
+import { Plus, FileText, RefreshCw, BookOpen, Trash2, FolderPlus } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { useWikiStore } from "@/stores/wiki-store"
-import { copyFile, listDirectory, readFile, writeFile, deleteFile, findRelatedWikiPages, preprocessFile } from "@/commands/fs"
+import { listDirectory, readFile, writeFile, deleteFile, findRelatedWikiPages } from "@/commands/fs"
+import { enqueueImportBatch } from "@/commands/import-queue"
 import type { FileNode } from "@/types/wiki"
-import { startIngest, autoIngest } from "@/lib/ingest"
+import { startIngest } from "@/lib/ingest"
 import { useTranslation } from "react-i18next"
 import { normalizePath, getFileName } from "@/lib/path-utils"
+
+const IMPORT_FILE_FILTERS = [
+  {
+    name: "Documents",
+    extensions: [
+      "md", "mdx", "txt", "rtf", "pdf",
+      "html", "htm", "xml",
+      "doc", "docx", "xls", "xlsx", "ppt", "pptx",
+      "odt", "ods", "odp", "epub", "pages", "numbers", "key",
+    ],
+  },
+  {
+    name: "Data",
+    extensions: ["json", "jsonl", "csv", "tsv", "yaml", "yml", "ndjson"],
+  },
+  {
+    name: "Code",
+    extensions: [
+      "py", "js", "ts", "jsx", "tsx", "rs", "go", "java",
+      "c", "cpp", "h", "rb", "php", "swift", "sql", "sh",
+    ],
+  },
+  {
+    name: "Images",
+    extensions: ["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "tiff", "avif", "heic"],
+  },
+  {
+    name: "Media",
+    extensions: ["mp4", "webm", "mov", "avi", "mkv", "mp3", "wav", "ogg", "flac", "m4a"],
+  },
+  { name: "All Files", extensions: ["*"] },
+]
+
+const SUPPORTED_SOURCE_EXTENSIONS = new Set(
+  IMPORT_FILE_FILTERS
+    .flatMap((filter) => filter.extensions)
+    .filter((extension) => extension !== "*")
+    .map((extension) => extension.toLowerCase())
+)
 
 export function SourcesView() {
   const { t } = useTranslation()
@@ -40,76 +80,62 @@ export function SourcesView() {
     loadSources()
   }, [loadSources])
 
+  const queueImportedPaths = useCallback(async (paths: string[], rootPath: string) => {
+    if (!project || paths.length === 0) return
+
+    const normalizedPaths = dedupeNormalizedPaths(paths)
+    if (normalizedPaths.length === 0) return
+
+    const projectPath = normalizePath(project.path)
+    await enqueueImportBatch(normalizePath(rootPath), normalizedPaths, projectPath)
+    await loadSources()
+    window.alert(t("sources.importQueued", { count: normalizedPaths.length }))
+  }, [project, loadSources, t])
+
   async function handleImport() {
     if (!project) return
 
     const selected = await open({
       multiple: true,
       title: "Import Source Files",
-      filters: [
-        {
-          name: "Documents",
-          extensions: [
-            "md", "mdx", "txt", "rtf", "pdf",
-            "html", "htm", "xml",
-            "doc", "docx", "xls", "xlsx", "ppt", "pptx",
-            "odt", "ods", "odp", "epub", "pages", "numbers", "key",
-          ],
-        },
-        {
-          name: "Data",
-          extensions: ["json", "jsonl", "csv", "tsv", "yaml", "yml", "ndjson"],
-        },
-        {
-          name: "Code",
-          extensions: [
-            "py", "js", "ts", "jsx", "tsx", "rs", "go", "java",
-            "c", "cpp", "h", "rb", "php", "swift", "sql", "sh",
-          ],
-        },
-        {
-          name: "Images",
-          extensions: ["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "tiff", "avif", "heic"],
-        },
-        {
-          name: "Media",
-          extensions: ["mp4", "webm", "mov", "avi", "mkv", "mp3", "wav", "ogg", "flac", "m4a"],
-        },
-        { name: "All Files", extensions: ["*"] },
-      ],
+      filters: IMPORT_FILE_FILTERS,
     })
 
     if (!selected || selected.length === 0) return
 
     setImporting(true)
-    const pp = normalizePath(project.path)
-    const paths = Array.isArray(selected) ? selected : [selected]
-
-    const importedPaths: string[] = []
-    for (const sourcePath of paths) {
-      const originalName = getFileName(sourcePath) || "unknown"
-      const destPath = await getUniqueDestPath(`${pp}/raw/sources`, originalName)
-      try {
-        await copyFile(sourcePath, destPath)
-        importedPaths.push(destPath)
-        // Pre-process file (extract text from PDF, etc.) for instant preview later
-        preprocessFile(destPath).catch(() => {})
-      } catch (err) {
-        console.error(`Failed to import ${originalName}:`, err)
-      }
+    try {
+      const paths = Array.isArray(selected) ? selected : [selected]
+      const normalizedPaths = dedupeNormalizedPaths(paths)
+      await queueImportedPaths(normalizedPaths, getParentDirectory(normalizedPaths[0]))
+    } catch (err) {
+      console.error("Failed to queue imported files:", err)
+      window.alert(String(err))
+    } finally {
+      setImporting(false)
     }
+  }
 
-    setImporting(false)
-    await loadSources()
+  async function handleImportFolder() {
+    if (!project) return
 
-    // Auto-ingest each imported file (runs in background, progress shown in activity panel)
-    if (llmConfig.apiKey || llmConfig.provider === "ollama") {
-      for (const destPath of importedPaths) {
-        const name = getFileName(destPath)
-        autoIngest(pp, destPath, llmConfig).catch((err) =>
-          console.error(`Failed to auto-ingest ${name}:`, err)
-        )
-      }
+    const selected = await open({
+      directory: true,
+      multiple: false,
+      title: t("sources.importFolder"),
+    })
+    if (!selected || Array.isArray(selected)) return
+
+    const rootPath = normalizePath(selected)
+    setImporting(true)
+    try {
+      const sourcePaths = await scanSupportedFiles(rootPath)
+      await queueImportedPaths(sourcePaths, rootPath)
+    } catch (err) {
+      console.error("Failed to queue imported folder:", err)
+      window.alert(t("sources.importFolderFailed", { error: String(err) }))
+    } finally {
+      setImporting(false)
     }
   }
 
@@ -286,6 +312,10 @@ export function SourcesView() {
             <Plus className="mr-1 h-4 w-4" />
             {importing ? t("sources.importing") : t("sources.import")}
           </Button>
+          <Button variant="outline" size="sm" onClick={handleImportFolder} disabled={importing}>
+            <FolderPlus className="mr-1 h-4 w-4" />
+            {t("sources.importFolder")}
+          </Button>
         </div>
       </div>
 
@@ -297,6 +327,10 @@ export function SourcesView() {
             <Button variant="outline" size="sm" onClick={handleImport}>
               <Plus className="mr-1 h-4 w-4" />
               {t("sources.importFiles")}
+            </Button>
+            <Button variant="outline" size="sm" onClick={handleImportFolder}>
+              <FolderPlus className="mr-1 h-4 w-4" />
+              {t("sources.importFolder")}
             </Button>
           </div>
         ) : (
@@ -345,47 +379,49 @@ export function SourcesView() {
   )
 }
 
-/**
- * Generate a unique destination path. If file already exists, adds date/counter suffix.
- * "file.pdf" → "file.pdf" (first time)
- * "file.pdf" → "file-20260406.pdf" (conflict)
- * "file.pdf" → "file-20260406-2.pdf" (second conflict same day)
- */
-async function getUniqueDestPath(dir: string, fileName: string): Promise<string> {
-  const basePath = `${dir}/${fileName}`
+async function scanSupportedFiles(rootPath: string): Promise<string[]> {
+  const queue = [normalizePath(rootPath)]
+  const sourcePaths: string[] = []
 
-  // Check if file exists by trying to read it
-  try {
-    await readFile(basePath)
-  } catch {
-    // File doesn't exist — use original name
-    return basePath
-  }
+  while (queue.length > 0) {
+    const currentPath = queue.shift()
+    if (!currentPath) continue
 
-  // File exists — add date suffix
-  const ext = fileName.includes(".") ? fileName.slice(fileName.lastIndexOf(".")) : ""
-  const nameWithoutExt = ext ? fileName.slice(0, -ext.length) : fileName
-  const date = new Date().toISOString().slice(0, 10).replace(/-/g, "")
+    const nodes = await listDirectory(currentPath)
+    for (const node of nodes) {
+      if (node.is_dir) {
+        queue.push(normalizePath(node.path))
+        continue
+      }
 
-  const withDate = `${dir}/${nameWithoutExt}-${date}${ext}`
-  try {
-    await readFile(withDate)
-  } catch {
-    return withDate
-  }
-
-  // Date suffix also exists — add counter
-  for (let i = 2; i <= 99; i++) {
-    const withCounter = `${dir}/${nameWithoutExt}-${date}-${i}${ext}`
-    try {
-      await readFile(withCounter)
-    } catch {
-      return withCounter
+      if (isSupportedSourceFile(node.path)) {
+        sourcePaths.push(normalizePath(node.path))
+      }
     }
   }
 
-  // Shouldn't happen, but fallback
-  return `${dir}/${nameWithoutExt}-${date}-${Date.now()}${ext}`
+  return dedupeNormalizedPaths(sourcePaths)
+}
+
+function isSupportedSourceFile(path: string): boolean {
+  const fileName = getFileName(path).toLowerCase()
+  const extIndex = fileName.lastIndexOf(".")
+  if (extIndex === -1 || extIndex === fileName.length - 1) return false
+  const extension = fileName.slice(extIndex + 1)
+  return SUPPORTED_SOURCE_EXTENSIONS.has(extension)
+}
+
+function dedupeNormalizedPaths(paths: string[]): string[] {
+  return [...new Set(paths.map((path) => normalizePath(path)).filter(Boolean))]
+}
+
+function getParentDirectory(path?: string): string {
+  if (!path) return ""
+  const normalized = normalizePath(path).replace(/\/+$/, "")
+  const lastSlashIndex = normalized.lastIndexOf("/")
+  if (lastSlashIndex === -1) return normalized
+  if (lastSlashIndex === 0) return "/"
+  return normalized.slice(0, lastSlashIndex)
 }
 
 function flattenFiles(nodes: FileNode[]): FileNode[] {
