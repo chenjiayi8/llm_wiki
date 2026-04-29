@@ -48,6 +48,10 @@ pub fn run() {
             commands::project::open_project,
             commands::import_queue::enqueue_import_batch,
             commands::import_queue::get_import_queue_summary,
+            commands::import_queue::claim_import_jobs,
+            commands::import_queue::update_import_job_stage,
+            commands::import_queue::complete_import_job,
+            commands::import_queue::fail_import_job,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
