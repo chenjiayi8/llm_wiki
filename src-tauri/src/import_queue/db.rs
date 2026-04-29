@@ -115,6 +115,56 @@ impl ImportQueueDb {
         .map_err(|err| err.to_string())
     }
 
+    pub fn enqueue_import_batch_atomic(
+        &self,
+        root_path: &str,
+        source_paths: Vec<String>,
+        project_path: &str,
+        max_attempts: i64,
+    ) -> Result<i64, String> {
+        self.with_conn_mut(|conn| {
+            let tx = conn.transaction()?;
+            tx.execute(
+                "INSERT INTO import_batches (root_path) VALUES (?1)",
+                params![root_path],
+            )?;
+            let batch_id = tx.last_insert_rowid();
+
+            for source_path in source_paths {
+                let source_name = derive_source_name(&source_path)
+                    .map_err(|_| rusqlite::Error::InvalidParameterName(source_path.clone()))?;
+                let dest_path = format!("{project_path}/raw/sources/{source_name}");
+
+                tx.execute(
+                    r#"
+                    INSERT INTO import_jobs (
+                        batch_id,
+                        source_path,
+                        source_name,
+                        dest_path,
+                        status,
+                        attempt_count,
+                        max_attempts
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6)
+                    "#,
+                    params![
+                        batch_id,
+                        source_path,
+                        source_name,
+                        dest_path,
+                        status_to_wire(ImportJobStatus::Queued),
+                        max_attempts,
+                    ],
+                )?;
+            }
+
+            recompute_batch_inner(&tx, batch_id)?;
+            tx.commit()?;
+            Ok(batch_id)
+        })
+        .map_err(|err| err.to_string())
+    }
+
     pub fn recompute_batch(&self, batch_id: i64) -> Result<(), String> {
         self.with_conn(|conn| recompute_batch_inner(conn, batch_id))
             .map_err(|err| err.to_string())
@@ -362,6 +412,17 @@ impl ImportQueueDb {
             .expect("import queue sqlite mutex poisoned");
         f(&guard)
     }
+
+    fn with_conn_mut<T>(
+        &self,
+        f: impl FnOnce(&mut Connection) -> rusqlite::Result<T>,
+    ) -> rusqlite::Result<T> {
+        let mut guard = self
+            .conn
+            .lock()
+            .expect("import queue sqlite mutex poisoned");
+        f(&mut guard)
+    }
 }
 
 fn status_to_wire(status: ImportJobStatus) -> &'static str {
@@ -374,6 +435,14 @@ fn status_to_wire(status: ImportJobStatus) -> &'static str {
         ImportJobStatus::Completed => "completed",
         ImportJobStatus::Failed => "failed",
     }
+}
+
+fn derive_source_name(source_path: &str) -> Result<String, String> {
+    Path::new(source_path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| name.to_string())
+        .ok_or_else(|| format!("Invalid source path: {source_path}"))
 }
 
 fn query_job_record(conn: &Connection, job_id: i64) -> rusqlite::Result<ImportJobRecord> {
@@ -515,6 +584,20 @@ mod tests {
         .unwrap()
     }
 
+    fn count_batches(db: &ImportQueueDb) -> i64 {
+        db.with_conn(|conn| {
+            conn.query_row("SELECT COUNT(*) FROM import_batches", [], |row| row.get(0))
+        })
+        .unwrap()
+    }
+
+    fn count_jobs(db: &ImportQueueDb) -> i64 {
+        db.with_conn(|conn| {
+            conn.query_row("SELECT COUNT(*) FROM import_jobs", [], |row| row.get(0))
+        })
+        .unwrap()
+    }
+
     #[test]
     fn bootstrap_creates_expected_tables() {
         let db = ImportQueueDb::open(temp_db_path("bootstrap")).unwrap();
@@ -625,5 +708,20 @@ mod tests {
         assert!(claimed
             .iter()
             .all(|job| job.status == ImportJobStatus::Copying));
+    }
+
+    #[test]
+    fn enqueue_import_batch_atomic_rolls_back_on_invalid_source_path() {
+        let db = ImportQueueDb::open(temp_db_path("atomic-rollback")).unwrap();
+        let result = db.enqueue_import_batch_atomic(
+            "/tmp/folder",
+            vec!["/tmp/folder/a.md".into(), "".into()],
+            "/tmp/project",
+            3,
+        );
+
+        assert!(result.is_err());
+        assert_eq!(count_batches(&db), 0);
+        assert_eq!(count_jobs(&db), 0);
     }
 }

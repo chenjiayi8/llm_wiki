@@ -4,20 +4,14 @@ mod import_queue;
 mod types;
 
 use std::fs;
-use std::path::PathBuf;
+use tauri::Manager;
 
-fn import_queue_db_path() -> PathBuf {
-    if let Some(home) = std::env::var_os("HOME") {
-        return PathBuf::from(home)
-            .join(".llm-wiki")
-            .join("import-queue.sqlite3");
-    }
-
-    std::env::temp_dir().join("llm-wiki-import-queue.sqlite3")
-}
-
-fn init_import_queue_db() -> Result<import_queue::db::ImportQueueDb, String> {
-    let db_path = import_queue_db_path();
+fn init_import_queue_db(app: &tauri::AppHandle) -> Result<import_queue::db::ImportQueueDb, String> {
+    let db_path = app
+        .path()
+        .app_data_dir()
+        .map_err(|err| format!("Failed to resolve app data directory: {err}"))?
+        .join("import-queue.sqlite3");
     if let Some(parent) = db_path.parent() {
         fs::create_dir_all(parent).map_err(|err| err.to_string())?;
     }
@@ -30,14 +24,17 @@ fn init_import_queue_db() -> Result<import_queue::db::ImportQueueDb, String> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     clip_server::start_clip_server();
-    let import_queue_db =
-        init_import_queue_db().expect("failed to initialize persistent import queue database");
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_store::Builder::default().build())
-        .manage(import_queue_db)
+        .setup(|app| {
+            let import_queue_db =
+                init_import_queue_db(app.handle()).map_err(std::io::Error::other)?;
+            app.manage(import_queue_db);
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             commands::fs::read_file,
             commands::fs::write_file,
