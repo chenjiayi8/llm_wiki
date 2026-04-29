@@ -4,7 +4,9 @@ import i18n from "@/i18n"
 import { useWikiStore } from "@/stores/wiki-store"
 import { useReviewStore } from "@/stores/review-store"
 import { useChatStore } from "@/stores/chat-store"
+import { useImportQueueStore } from "@/stores/import-queue-store"
 import { listDirectory, openProject } from "@/commands/fs"
+import { getImportQueueSummary } from "@/commands/import-queue"
 import { getLastProject, getRecentProjects, saveLastProject, loadLlmConfig, loadLanguage, loadSearchApiConfig } from "@/lib/project-store"
 import { loadReviewItems, loadChatHistory } from "@/lib/persist"
 import { setupAutoSave } from "@/lib/auto-save"
@@ -27,6 +29,34 @@ function App() {
   useEffect(() => {
     setupAutoSave()
     startClipWatcher()
+  }, [])
+
+  // Keep import queue summary fresh for background import UX.
+  useEffect(() => {
+    let cancelled = false
+
+    const pollSummary = async () => {
+      try {
+        const summary = await getImportQueueSummary()
+        if (!cancelled) {
+          useImportQueueStore.getState().setSummary(summary)
+        }
+      } catch {
+        if (!cancelled) {
+          useImportQueueStore.getState().setSummary(null)
+        }
+      }
+    }
+
+    void pollSummary()
+    const intervalId = window.setInterval(() => {
+      void pollSummary()
+    }, 1000)
+
+    return () => {
+      cancelled = true
+      window.clearInterval(intervalId)
+    }
   }, [])
 
   // Auto-open last project on startup
