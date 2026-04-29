@@ -455,16 +455,12 @@ fn recompute_batch_inner(conn: &Connection, batch_id: i64) -> rusqlite::Result<(
         },
     )?;
 
-    let status = if total_jobs == 0 || queued_jobs > 0 {
-        "queued"
-    } else if running_jobs > 0 || retrying_jobs > 0 {
+    let status = if queued_jobs > 0 || running_jobs > 0 || retrying_jobs > 0 {
         "running"
     } else if failed_jobs > 0 {
-        "failed"
-    } else if completed_jobs == total_jobs {
-        "completed"
+        "completed_with_errors"
     } else {
-        "running"
+        "completed"
     };
 
     conn.execute(
@@ -496,6 +492,7 @@ fn recompute_batch_inner(conn: &Connection, batch_id: i64) -> rusqlite::Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::params;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -505,6 +502,17 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("llm-wiki-{name}-{nonce}.sqlite3"))
+    }
+
+    fn batch_status(db: &ImportQueueDb, batch_id: i64) -> String {
+        db.with_conn(|conn| {
+            conn.query_row(
+                "SELECT status FROM import_batches WHERE id = ?1",
+                params![batch_id],
+                |row| row.get::<_, String>(0),
+            )
+        })
+        .unwrap()
     }
 
     #[test]
@@ -557,6 +565,7 @@ mod tests {
         .unwrap();
 
         db.recompute_batch(batch_id).unwrap();
+        assert_eq!(batch_status(&db, batch_id), "running");
         let summary = db.global_summary(5).unwrap();
         assert_eq!(summary.active_batches, 1);
         assert_eq!(summary.total_jobs, 1);
@@ -564,6 +573,36 @@ mod tests {
         assert_eq!(summary.max_concurrency, 5);
         assert!(!summary.headline.is_empty());
         assert!(!summary.is_idle);
+    }
+
+    #[test]
+    fn recompute_batch_sets_completed_with_errors_when_terminal_failures_exist() {
+        let db = ImportQueueDb::open(temp_db_path("completed-with-errors")).unwrap();
+        let batch_id = db.insert_batch("/tmp/folder").unwrap();
+        let job_a = db
+            .insert_job(NewImportJob {
+                batch_id,
+                source_path: "/tmp/folder/a.md".into(),
+                source_name: "a.md".into(),
+                dest_path: "/tmp/project/raw/sources/a.md".into(),
+                max_attempts: 3,
+            })
+            .unwrap();
+        let job_b = db
+            .insert_job(NewImportJob {
+                batch_id,
+                source_path: "/tmp/folder/b.md".into(),
+                source_name: "b.md".into(),
+                dest_path: "/tmp/project/raw/sources/b.md".into(),
+                max_attempts: 3,
+            })
+            .unwrap();
+
+        db.mark_job_failed(job_a, "copy failed").unwrap();
+        db.mark_job_completed(job_b, "[]").unwrap();
+        db.recompute_batch(batch_id).unwrap();
+
+        assert_eq!(batch_status(&db, batch_id), "completed_with_errors");
     }
 
     #[test]
