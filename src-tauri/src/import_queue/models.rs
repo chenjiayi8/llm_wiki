@@ -67,3 +67,25 @@ pub struct ImportBatchSummary {
     pub headline: String,
     pub max_concurrency: usize,
 }
+
+pub fn build_headline(summary: &ImportBatchSummary) -> String {
+    if summary.total_jobs == 0 {
+        return "Import queue is idle".to_string();
+    }
+
+    if summary.is_idle {
+        if summary.failed_jobs > 0 {
+            return format!(
+                "Import queue paused: {} completed, {} failed",
+                summary.completed_jobs, summary.failed_jobs
+            );
+        }
+
+        return format!("Import queue idle: {} completed", summary.completed_jobs);
+    }
+
+    format!(
+        "Import queue: {} queued, {} running, {} retrying",
+        summary.queued_jobs, summary.running_jobs, summary.retrying_jobs
+    )
+}
