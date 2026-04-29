@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -130,11 +131,14 @@ impl ImportQueueDb {
                 params![root_path],
             )?;
             let batch_id = tx.last_insert_rowid();
+            let dest_dir = format!("{}/raw/sources", project_path.trim_end_matches('/'));
+            let mut reserved_dest_paths = collect_reserved_dest_paths(&tx, &dest_dir)?;
 
             for source_path in source_paths {
                 let source_name = derive_source_name(&source_path)
                     .map_err(|_| rusqlite::Error::InvalidParameterName(source_path.clone()))?;
-                let dest_path = format!("{project_path}/raw/sources/{source_name}");
+                let dest_path =
+                    next_unique_dest_path(&dest_dir, &source_name, &mut reserved_dest_paths);
 
                 tx.execute(
                     r#"
@@ -505,6 +509,68 @@ fn derive_source_name(source_path: &str) -> Result<String, String> {
         .ok_or_else(|| format!("Invalid source path: {source_path}"))
 }
 
+fn collect_reserved_dest_paths(
+    conn: &Connection,
+    dest_dir: &str,
+) -> rusqlite::Result<HashSet<String>> {
+    let mut reserved = HashSet::new();
+    let like_pattern = format!("{}/%", dest_dir.trim_end_matches('/'));
+    let mut stmt = conn.prepare("SELECT dest_path FROM import_jobs WHERE dest_path LIKE ?1")?;
+    let rows = stmt.query_map(params![like_pattern], |row| row.get::<_, String>(0))?;
+    for row in rows {
+        reserved.insert(row?);
+    }
+    Ok(reserved)
+}
+
+fn next_unique_dest_path(
+    dest_dir: &str,
+    source_name: &str,
+    reserved_dest_paths: &mut HashSet<String>,
+) -> String {
+    let normalized_dest_dir = dest_dir.trim_end_matches('/');
+    let base_candidate = format!("{normalized_dest_dir}/{source_name}");
+    if !is_dest_taken(&base_candidate, reserved_dest_paths) {
+        reserved_dest_paths.insert(base_candidate.clone());
+        return base_candidate;
+    }
+
+    let (stem, ext) = split_file_stem_and_extension(source_name);
+    let date = Utc::now().format("%Y%m%d").to_string();
+    let dated_candidate = format!("{normalized_dest_dir}/{stem}-{date}{ext}");
+    if !is_dest_taken(&dated_candidate, reserved_dest_paths) {
+        reserved_dest_paths.insert(dated_candidate.clone());
+        return dated_candidate;
+    }
+
+    for counter in 2..=9999 {
+        let candidate = format!("{normalized_dest_dir}/{stem}-{date}-{counter}{ext}");
+        if !is_dest_taken(&candidate, reserved_dest_paths) {
+            reserved_dest_paths.insert(candidate.clone());
+            return candidate;
+        }
+    }
+
+    let fallback = format!(
+        "{normalized_dest_dir}/{stem}-{date}-{}{}",
+        Utc::now().timestamp_millis(),
+        ext
+    );
+    reserved_dest_paths.insert(fallback.clone());
+    fallback
+}
+
+fn is_dest_taken(candidate_path: &str, reserved_dest_paths: &HashSet<String>) -> bool {
+    reserved_dest_paths.contains(candidate_path) || Path::new(candidate_path).exists()
+}
+
+fn split_file_stem_and_extension(file_name: &str) -> (&str, &str) {
+    match file_name.rfind('.') {
+        Some(index) if index > 0 => (&file_name[..index], &file_name[index..]),
+        _ => (file_name, ""),
+    }
+}
+
 fn compute_next_retry_timestamp(attempt_count: i64) -> String {
     let bounded_attempt = attempt_count.max(1).min(3);
     let delay_seconds = 15 * (1_i64 << (bounded_attempt - 1));
@@ -630,6 +696,7 @@ fn recompute_batch_inner(conn: &Connection, batch_id: i64) -> rusqlite::Result<(
 mod tests {
     use super::*;
     use rusqlite::params;
+    use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -868,5 +935,70 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(count_batches(&db), 0);
         assert_eq!(count_jobs(&db), 0);
+    }
+
+    #[test]
+    fn enqueue_import_batch_atomic_generates_unique_dest_paths_for_duplicate_names() {
+        let db = ImportQueueDb::open(temp_db_path("unique-dest-paths")).unwrap();
+        let batch_id = db
+            .enqueue_import_batch_atomic(
+                "/tmp/folder",
+                vec!["/tmp/folder/report.md".into(), "/tmp/other/report.md".into()],
+                "/tmp/project",
+                3,
+            )
+            .unwrap();
+
+        let dest_paths = db
+            .with_conn(|conn| {
+                let mut stmt =
+                    conn.prepare("SELECT dest_path FROM import_jobs WHERE batch_id = ?1 ORDER BY id ASC")?;
+                let rows = stmt.query_map(params![batch_id], |row| row.get::<_, String>(0))?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .unwrap();
+
+        assert_eq!(dest_paths.len(), 2);
+        assert_ne!(dest_paths[0], dest_paths[1]);
+        assert!(dest_paths[0].ends_with("/raw/sources/report.md"));
+        assert!(dest_paths[1].contains("/raw/sources/report-"));
+    }
+
+    #[test]
+    fn enqueue_import_batch_atomic_avoids_collisions_with_existing_source_files() {
+        let db = ImportQueueDb::open(temp_db_path("filesystem-collision")).unwrap();
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let project_path = std::env::temp_dir().join(format!("llm-wiki-project-{nonce}"));
+        let raw_sources_path = project_path.join("raw").join("sources");
+        fs::create_dir_all(&raw_sources_path).unwrap();
+        fs::write(raw_sources_path.join("report.md"), "existing content").unwrap();
+
+        let batch_id = db
+            .enqueue_import_batch_atomic(
+                "/tmp/folder",
+                vec!["/tmp/folder/report.md".into()],
+                &project_path.to_string_lossy(),
+                3,
+            )
+            .unwrap();
+
+        let queued_dest_path = db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT dest_path FROM import_jobs WHERE batch_id = ?1 LIMIT 1",
+                    params![batch_id],
+                    |row| row.get::<_, String>(0),
+                )
+            })
+            .unwrap();
+
+        assert_ne!(
+            queued_dest_path,
+            format!("{}/raw/sources/report.md", project_path.to_string_lossy())
+        );
+        assert!(queued_dest_path.contains("/raw/sources/report-"));
     }
 }
