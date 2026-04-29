@@ -4,16 +4,23 @@ import type {
   ImportJobStatus,
   ImportQueueSummary,
 } from "@/stores/import-queue-store"
+import { normalizePath } from "@/lib/path-utils"
 
 export async function enqueueImportBatch(
   rootPath: string,
   sourcePaths: string[],
   projectPath: string
 ): Promise<number> {
+  const normalizedRootPath = normalizePath(rootPath)
+  const normalizedProjectPath = normalizePath(projectPath)
+  const normalizedSourcePaths = [
+    ...new Set(sourcePaths.map((path) => normalizePath(path)).filter(Boolean)),
+  ]
+
   return invoke<number>("enqueue_import_batch", {
-    rootPath,
-    sourcePaths,
-    projectPath,
+    rootPath: normalizedRootPath,
+    sourcePaths: normalizedSourcePaths,
+    projectPath: normalizedProjectPath,
   })
 }
 
