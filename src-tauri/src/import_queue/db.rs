@@ -181,7 +181,14 @@ impl ImportQueueDb {
                 SELECT id
                 FROM import_jobs
                 WHERE status = 'queued'
-                ORDER BY id ASC
+                    OR (
+                        status = 'retry_wait'
+                        AND next_retry_at IS NOT NULL
+                        AND datetime(next_retry_at) <= CURRENT_TIMESTAMP
+                    )
+                ORDER BY
+                    CASE WHEN status = 'queued' THEN 0 ELSE 1 END,
+                    id ASC
                 LIMIT ?1
                 "#,
             )?;
@@ -201,8 +208,13 @@ impl ImportQueueDb {
                     r#"
                     UPDATE import_jobs
                     SET status = ?2,
+                        next_retry_at = NULL,
                         updated_at = CURRENT_TIMESTAMP
-                    WHERE id = ?1 AND status = 'queued'
+                    WHERE id = ?1
+                        AND (
+                            status = 'queued'
+                            OR status = 'retry_wait'
+                        )
                     "#,
                     params![id, status_to_wire(ImportJobStatus::Copying)],
                 )?;
@@ -708,6 +720,50 @@ mod tests {
         assert!(claimed
             .iter()
             .all(|job| job.status == ImportJobStatus::Copying));
+    }
+
+    #[test]
+    fn failed_job_moves_to_retry_wait_before_terminal_failure() {
+        let db = ImportQueueDb::open(temp_db_path("retry")).unwrap();
+        let batch_id = db.insert_batch("/tmp/folder").unwrap();
+        let job_id = db
+            .insert_job(NewImportJob {
+                batch_id,
+                source_path: "/tmp/folder/a.md".into(),
+                source_name: "a.md".into(),
+                dest_path: "/tmp/project/raw/sources/a.md".into(),
+                max_attempts: 3,
+            })
+            .unwrap();
+
+        db.mark_job_retry(job_id, 1, "2099-01-01T00:00:00Z", "network")
+            .unwrap();
+        let job = db.get_job(job_id).unwrap();
+        assert_eq!(job.status, ImportJobStatus::RetryWait);
+    }
+
+    #[test]
+    fn claim_next_jobs_reclaims_ready_retry_jobs() {
+        let db = ImportQueueDb::open(temp_db_path("claim-retry-ready")).unwrap();
+        let batch_id = db.insert_batch("/tmp/folder").unwrap();
+        let job_id = db
+            .insert_job(NewImportJob {
+                batch_id,
+                source_path: "/tmp/folder/a.md".into(),
+                source_name: "a.md".into(),
+                dest_path: "/tmp/project/raw/sources/a.md".into(),
+                max_attempts: 3,
+            })
+            .unwrap();
+
+        db.mark_job_retry(job_id, 1, "2000-01-01T00:00:00Z", "network")
+            .unwrap();
+
+        let claimed = db.claim_next_jobs(1).unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].id, job_id);
+        assert_eq!(claimed[0].status, ImportJobStatus::Copying);
+        assert_eq!(claimed[0].attempt_count, 1);
     }
 
     #[test]

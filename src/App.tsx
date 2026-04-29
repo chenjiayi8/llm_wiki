@@ -11,6 +11,7 @@ import { getLastProject, getRecentProjects, saveLastProject, loadLlmConfig, load
 import { loadReviewItems, loadChatHistory } from "@/lib/persist"
 import { setupAutoSave } from "@/lib/auto-save"
 import { startClipWatcher } from "@/lib/clip-watcher"
+import { startImportQueueRunner } from "@/lib/import-queue-runner"
 import { AppLayout } from "@/components/layout/app-layout"
 import { WelcomeScreen } from "@/components/project/welcome-screen"
 import { CreateProjectDialog } from "@/components/project/create-project-dialog"
@@ -150,6 +151,10 @@ function App() {
     } catch {
       // ignore, start fresh
     }
+
+    window.setTimeout(() => {
+      startImportQueueRunner()
+    }, 0)
   }
 
   async function handleSelectRecent(proj: WikiProject) {
