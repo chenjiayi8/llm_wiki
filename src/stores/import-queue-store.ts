@@ -32,6 +32,10 @@ export interface ImportQueueSummary {
   max_concurrency: number
 }
 
+export function isImportQueueActive(summary: ImportQueueSummary | null): summary is ImportQueueSummary {
+  return !!summary && !summary.is_idle
+}
+
 interface ImportQueueState {
   summary: ImportQueueSummary | null
   setSummary: (summary: ImportQueueSummary | null) => void
