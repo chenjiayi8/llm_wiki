@@ -26,8 +26,16 @@ impl ImportQueueDb {
                 r#"
                 CREATE TABLE IF NOT EXISTS import_batches (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    source_root TEXT NOT NULL,
-                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    root_path TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'queued',
+                    total_jobs INTEGER NOT NULL DEFAULT 0,
+                    queued_jobs INTEGER NOT NULL DEFAULT 0,
+                    running_jobs INTEGER NOT NULL DEFAULT 0,
+                    completed_jobs INTEGER NOT NULL DEFAULT 0,
+                    failed_jobs INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
 
                 CREATE TABLE IF NOT EXISTS import_jobs (
@@ -39,10 +47,14 @@ impl ImportQueueDb {
                     status TEXT NOT NULL,
                     attempt_count INTEGER NOT NULL DEFAULT 0,
                     max_attempts INTEGER NOT NULL,
+                    next_retry_at TEXT,
+                    last_error TEXT,
+                    files_written_json TEXT NOT NULL DEFAULT '[]',
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
 
+                CREATE INDEX IF NOT EXISTS idx_import_batches_status ON import_batches(status);
                 CREATE INDEX IF NOT EXISTS idx_import_jobs_status ON import_jobs(status);
                 CREATE INDEX IF NOT EXISTS idx_import_jobs_batch_id ON import_jobs(batch_id);
                 "#,
@@ -60,11 +72,11 @@ impl ImportQueueDb {
         })
     }
 
-    pub fn insert_batch(&self, source_root: &str) -> rusqlite::Result<i64> {
+    pub fn insert_batch(&self, root_path: &str) -> rusqlite::Result<i64> {
         self.with_conn(|conn| {
             conn.execute(
-                "INSERT INTO import_batches (source_root) VALUES (?1)",
-                params![source_root],
+                "INSERT INTO import_batches (root_path) VALUES (?1)",
+                params![root_path],
             )?;
             Ok(conn.last_insert_rowid())
         })

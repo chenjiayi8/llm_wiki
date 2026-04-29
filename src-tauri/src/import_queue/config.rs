@@ -10,7 +10,7 @@ pub fn load_import_max_concurrency() -> usize {
         .unwrap_or(DEFAULT_IMPORT_MAX_CONCURRENCY)
 }
 
-fn load_from_dotenv_file(path: &Path) -> Option<String> {
+pub fn load_from_dotenv_file(path: &Path) -> Option<String> {
     let text = fs::read_to_string(path).ok()?;
     text.lines()
         .map(str::trim)
