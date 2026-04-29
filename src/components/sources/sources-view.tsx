@@ -107,7 +107,8 @@ export function SourcesView() {
     try {
       const paths = Array.isArray(selected) ? selected : [selected]
       const normalizedPaths = dedupeNormalizedPaths(paths)
-      await queueImportedPaths(normalizedPaths, getParentDirectory(normalizedPaths[0]))
+      const rootPath = deriveManualSelectionRootPath(normalizedPaths)
+      await queueImportedPaths(normalizedPaths, rootPath)
     } catch (err) {
       console.error("Failed to queue imported files:", err)
       window.alert(String(err))
@@ -380,17 +381,23 @@ export function SourcesView() {
 }
 
 async function scanSupportedFiles(rootPath: string): Promise<string[]> {
-  const queue = [normalizePath(rootPath)]
+  const visitedDirectories = new Set<string>()
   const sourcePaths: string[] = []
 
-  while (queue.length > 0) {
-    const currentPath = queue.shift()
-    if (!currentPath) continue
-
-    const nodes = await listDirectory(currentPath)
+  const collectFromNodes = async (nodes: FileNode[]) => {
     for (const node of nodes) {
       if (node.is_dir) {
-        queue.push(normalizePath(node.path))
+        const dirPath = normalizePath(node.path)
+        if (visitedDirectories.has(dirPath)) continue
+        visitedDirectories.add(dirPath)
+
+        if (node.children && node.children.length > 0) {
+          await collectFromNodes(node.children)
+          continue
+        }
+
+        const children = await listDirectory(dirPath)
+        await collectFromNodes(children)
         continue
       }
 
@@ -400,7 +407,72 @@ async function scanSupportedFiles(rootPath: string): Promise<string[]> {
     }
   }
 
+  const normalizedRootPath = normalizePath(rootPath)
+  if (!visitedDirectories.has(normalizedRootPath)) {
+    visitedDirectories.add(normalizedRootPath)
+  }
+
+  const rootNodes = await listDirectory(normalizedRootPath)
+  await collectFromNodes(rootNodes)
+
   return dedupeNormalizedPaths(sourcePaths)
+}
+
+function deriveManualSelectionRootPath(paths: string[]): string {
+  if (paths.length === 0) return "manual-selection"
+
+  const directories = dedupeNormalizedPaths(
+    paths.map((path) => getParentDirectory(path)).filter(Boolean)
+  )
+  if (directories.length === 0) return "manual-selection"
+  if (directories.length === 1) return directories[0]
+
+  const firstSegments = splitPathSegments(directories[0])
+  if (firstSegments.length === 0) return "manual-selection"
+
+  let sharedPrefixLength = firstSegments.length
+  for (let i = 1; i < directories.length; i++) {
+    const segments = splitPathSegments(directories[i])
+    let matchLength = 0
+    while (
+      matchLength < sharedPrefixLength &&
+      matchLength < segments.length &&
+      segments[matchLength] === firstSegments[matchLength]
+    ) {
+      matchLength += 1
+    }
+    sharedPrefixLength = matchLength
+    if (sharedPrefixLength === 0) break
+  }
+
+  if (sharedPrefixLength === 0) return "manual-selection"
+
+  const candidate = joinPathSegments(
+    firstSegments.slice(0, sharedPrefixLength),
+    isAbsolutePath(directories[0])
+  )
+
+  if (!candidate || candidate === "/" || /^[A-Za-z]:$/.test(candidate)) {
+    return "manual-selection"
+  }
+
+  return candidate
+}
+
+function splitPathSegments(path: string): string[] {
+  return normalizePath(path)
+    .split("/")
+    .filter((segment) => segment.length > 0)
+}
+
+function joinPathSegments(segments: string[], absolute: boolean): string {
+  if (segments.length === 0) return absolute ? "/" : ""
+  return `${absolute ? "/" : ""}${segments.join("/")}`
+}
+
+function isAbsolutePath(path: string): boolean {
+  const normalized = normalizePath(path)
+  return normalized.startsWith("/") || /^[A-Za-z]:\//.test(normalized)
 }
 
 function isSupportedSourceFile(path: string): boolean {
