@@ -1,26 +1,35 @@
 import { create } from "zustand"
 
+export type ImportJobStatus =
+  | "queued"
+  | "copying"
+  | "preprocessing"
+  | "ingesting"
+  | "retry_wait"
+  | "completed"
+  | "failed"
+
 export interface ImportJobRecord {
   id: number
-  root_path: string
+  batch_id: number
   source_path: string
-  project_path: string
-  status: string
+  source_name: string
+  dest_path: string
+  status: ImportJobStatus
   attempt_count: number
-  last_error: string | null
-  files_written_json: string | null
-  created_at: string
-  updated_at: string
-  claimed_at: string | null
 }
 
 export interface ImportQueueSummary {
-  pending: number
-  processing: number
-  completed: number
-  failed: number
-  total: number
-  jobs: ImportJobRecord[]
+  active_batches: number
+  total_jobs: number
+  queued_jobs: number
+  running_jobs: number
+  retrying_jobs: number
+  completed_jobs: number
+  failed_jobs: number
+  is_idle: boolean
+  headline: string
+  max_concurrency: number
 }
 
 interface ImportQueueState {
