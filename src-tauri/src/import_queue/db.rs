@@ -1,6 +1,7 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+use chrono::{Duration, Utc};
 use rusqlite::{params, types::Type, Connection};
 
 use crate::import_queue::models::{
@@ -327,6 +328,53 @@ impl ImportQueueDb {
         .map_err(|err| err.to_string())
     }
 
+    pub fn fail_job_with_retry_policy(&self, id: i64, last_error: &str) -> Result<(), String> {
+        self.with_conn_mut(|conn| {
+            let tx = conn.transaction()?;
+
+            let (batch_id, attempt_count, max_attempts): (i64, i64, i64) = tx.query_row(
+                "SELECT batch_id, attempt_count, max_attempts FROM import_jobs WHERE id = ?1",
+                params![id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+
+            let next_attempt = attempt_count + 1;
+            if next_attempt < max_attempts {
+                let next_retry_at = compute_next_retry_timestamp(next_attempt);
+                tx.execute(
+                    r#"
+                    UPDATE import_jobs
+                    SET status = 'retry_wait',
+                        attempt_count = ?2,
+                        next_retry_at = ?3,
+                        last_error = ?4,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?1
+                    "#,
+                    params![id, next_attempt, next_retry_at, last_error],
+                )?;
+            } else {
+                tx.execute(
+                    r#"
+                    UPDATE import_jobs
+                    SET status = 'failed',
+                        attempt_count = ?2,
+                        next_retry_at = NULL,
+                        last_error = ?3,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?1
+                    "#,
+                    params![id, next_attempt, last_error],
+                )?;
+            }
+
+            recompute_batch_inner(&tx, batch_id)?;
+            tx.commit()?;
+            Ok(())
+        })
+        .map_err(|err| err.to_string())
+    }
+
     pub fn recover_stale_jobs(&self) -> Result<(), String> {
         self.with_conn(|conn| {
             conn.execute(
@@ -455,6 +503,14 @@ fn derive_source_name(source_path: &str) -> Result<String, String> {
         .and_then(|name| name.to_str())
         .map(|name| name.to_string())
         .ok_or_else(|| format!("Invalid source path: {source_path}"))
+}
+
+fn compute_next_retry_timestamp(attempt_count: i64) -> String {
+    let bounded_attempt = attempt_count.max(1).min(3);
+    let delay_seconds = 15 * (1_i64 << (bounded_attempt - 1));
+    (Utc::now() + Duration::seconds(delay_seconds))
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string()
 }
 
 fn query_job_record(conn: &Connection, job_id: i64) -> rusqlite::Result<ImportJobRecord> {
@@ -764,6 +820,39 @@ mod tests {
         assert_eq!(claimed[0].id, job_id);
         assert_eq!(claimed[0].status, ImportJobStatus::Copying);
         assert_eq!(claimed[0].attempt_count, 1);
+    }
+
+    #[test]
+    fn fail_job_with_retry_policy_uses_stored_attempt_progression() {
+        let db = ImportQueueDb::open(temp_db_path("auto-retry-policy")).unwrap();
+        let batch_id = db.insert_batch("/tmp/folder").unwrap();
+        let job_id = db
+            .insert_job(NewImportJob {
+                batch_id,
+                source_path: "/tmp/folder/a.md".into(),
+                source_name: "a.md".into(),
+                dest_path: "/tmp/project/raw/sources/a.md".into(),
+                max_attempts: 3,
+            })
+            .unwrap();
+
+        db.fail_job_with_retry_policy(job_id, "network-1").unwrap();
+        let first = db.get_job(job_id).unwrap();
+        assert_eq!(first.status, ImportJobStatus::RetryWait);
+        assert_eq!(first.attempt_count, 1);
+        assert_eq!(batch_status(&db, batch_id), "running");
+
+        db.fail_job_with_retry_policy(job_id, "network-2").unwrap();
+        let second = db.get_job(job_id).unwrap();
+        assert_eq!(second.status, ImportJobStatus::RetryWait);
+        assert_eq!(second.attempt_count, 2);
+        assert_eq!(batch_status(&db, batch_id), "running");
+
+        db.fail_job_with_retry_policy(job_id, "network-3").unwrap();
+        let third = db.get_job(job_id).unwrap();
+        assert_eq!(third.status, ImportJobStatus::Failed);
+        assert_eq!(third.attempt_count, 3);
+        assert_eq!(batch_status(&db, batch_id), "completed_with_errors");
     }
 
     #[test]

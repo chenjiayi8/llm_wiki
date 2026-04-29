@@ -1,4 +1,3 @@
-use chrono::{Duration, Utc};
 use tauri::State;
 
 use crate::import_queue::{
@@ -53,21 +52,8 @@ pub fn complete_import_job(
 pub fn fail_import_job(
     db: State<ImportQueueDb>,
     job_id: i64,
-    attempt_count: i64,
+    _attempt_count: i64,
     last_error: String,
 ) -> Result<(), String> {
-    if attempt_count < 3 {
-        let next_retry_at = compute_next_retry_timestamp(attempt_count);
-        return db.mark_job_retry(job_id, attempt_count, &next_retry_at, &last_error);
-    }
-
-    db.mark_job_failed(job_id, &last_error)
-}
-
-fn compute_next_retry_timestamp(attempt_count: i64) -> String {
-    let bounded_attempt = attempt_count.max(1).min(3);
-    let delay_seconds = 15 * (1_i64 << (bounded_attempt - 1));
-    (Utc::now() + Duration::seconds(delay_seconds))
-        .format("%Y-%m-%dT%H:%M:%SZ")
-        .to_string()
+    db.fail_job_with_retry_policy(job_id, &last_error)
 }
