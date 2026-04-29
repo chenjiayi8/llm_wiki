@@ -4,6 +4,7 @@ import {
   FileText, Users, Lightbulb, BookOpen, GitMerge, BarChart3, HelpCircle, Layout,
 } from "lucide-react"
 import { useActivityStore, type ActivityItem } from "@/stores/activity-store"
+import { useImportQueueStore, isImportQueueActive } from "@/stores/import-queue-store"
 import { useWikiStore } from "@/stores/wiki-store"
 import { normalizePath, getFileName } from "@/lib/path-utils"
 
@@ -30,11 +31,14 @@ function getFileTypeInfo(path: string): { icon: typeof FileText; type: string } 
 export function ActivityPanel() {
   const items = useActivityStore((s) => s.items)
   const clearDone = useActivityStore((s) => s.clearDone)
+  const summary = useImportQueueStore((s) => s.summary)
   const [expanded, setExpanded] = useState(false)
   const prevRunningRef = useRef(0)
 
+  const importActive = isImportQueueActive(summary)
   const runningCount = items.filter((i) => i.status === "running").length
   const hasItems = items.length > 0
+  const showPanel = hasItems || importActive
 
   // Auto-expand when a new task starts running
   useEffect(() => {
@@ -44,9 +48,14 @@ export function ActivityPanel() {
     prevRunningRef.current = runningCount
   }, [runningCount])
 
-  if (!hasItems) return null
+  if (!showPanel) return null
 
   const latestItem = items[0]
+  const headerText = importActive
+    ? summary.headline
+    : runningCount > 0
+      ? `Processing: ${latestItem?.title ?? "..."}`
+      : `Done: ${latestItem?.title ?? "All tasks complete"}`
 
   return (
     <div className="border-t bg-muted/30">
@@ -54,16 +63,24 @@ export function ActivityPanel() {
         onClick={() => setExpanded(!expanded)}
         className="flex w-full items-center gap-2 px-3 py-1.5 text-xs text-muted-foreground hover:bg-accent/50"
       >
-        {runningCount > 0 ? (
+        {importActive || runningCount > 0 ? (
           <Loader2 className="h-3 w-3 animate-spin shrink-0" />
         ) : (
           <CheckCircle2 className="h-3 w-3 shrink-0 text-emerald-500" />
         )}
         <span className="flex-1 truncate text-left">
-          {runningCount > 0
-            ? `Processing: ${latestItem?.title ?? "..."}`
-            : `Done: ${latestItem?.title ?? "All tasks complete"}`}
+          {headerText}
         </span>
+        {importActive && summary && (
+          <span className="flex items-center gap-2 text-[10px]">
+            <span className="rounded bg-background/70 px-1.5 py-0.5 tabular-nums">
+              {summary.completed_jobs}/{summary.total_jobs}
+            </span>
+            <span className="rounded bg-background/70 px-1.5 py-0.5 tabular-nums">
+              {summary.running_jobs} running
+            </span>
+          </span>
+        )}
         {expanded ? (
           <ChevronDown className="h-3 w-3 shrink-0" />
         ) : (
@@ -73,6 +90,19 @@ export function ActivityPanel() {
 
       {expanded && (
         <div className="max-h-64 overflow-y-auto border-t">
+          {importActive && summary && (
+            <div className="px-3 py-1.5 text-[10px] text-muted-foreground border-b border-border/50">
+              <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+                <span className="tabular-nums">
+                  Completed {summary.completed_jobs}/{summary.total_jobs}
+                </span>
+                <span className="tabular-nums">Running {summary.running_jobs}</span>
+                <span className="tabular-nums">Max {summary.max_concurrency}</span>
+                <span className="tabular-nums">Retrying {summary.retrying_jobs}</span>
+                <span className="tabular-nums text-destructive">Failed {summary.failed_jobs}</span>
+              </div>
+            </div>
+          )}
           {items.map((item) => (
             <ActivityRow key={item.id} item={item} />
           ))}
