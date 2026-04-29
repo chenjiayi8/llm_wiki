@@ -3,7 +3,9 @@ use std::sync::{Arc, Mutex};
 
 use rusqlite::{params, types::Type, Connection};
 
-use crate::import_queue::models::{ImportJobRecord, ImportJobStatus, NewImportJob};
+use crate::import_queue::models::{
+    build_headline, ImportBatchSummary, ImportJobRecord, ImportJobStatus, NewImportJob,
+};
 
 #[derive(Clone)]
 pub struct ImportQueueDb {
@@ -74,7 +76,7 @@ impl ImportQueueDb {
         })
     }
 
-    pub fn insert_batch(&self, root_path: &str) -> rusqlite::Result<i64> {
+    pub fn insert_batch(&self, root_path: &str) -> Result<i64, String> {
         self.with_conn(|conn| {
             conn.execute(
                 "INSERT INTO import_batches (root_path) VALUES (?1)",
@@ -82,9 +84,10 @@ impl ImportQueueDb {
             )?;
             Ok(conn.last_insert_rowid())
         })
+        .map_err(|err| err.to_string())
     }
 
-    pub fn insert_job(&self, new_job: NewImportJob) -> rusqlite::Result<i64> {
+    pub fn insert_job(&self, new_job: NewImportJob) -> Result<i64, String> {
         self.with_conn(|conn| {
             conn.execute(
                 r#"
@@ -109,19 +112,160 @@ impl ImportQueueDb {
             )?;
             Ok(conn.last_insert_rowid())
         })
+        .map_err(|err| err.to_string())
     }
 
-    pub fn mark_job_stage(&self, job_id: i64, status: ImportJobStatus) -> rusqlite::Result<()> {
+    pub fn recompute_batch(&self, batch_id: i64) -> Result<(), String> {
+        self.with_conn(|conn| recompute_batch_inner(conn, batch_id))
+            .map_err(|err| err.to_string())
+    }
+
+    pub fn claim_next_jobs(&self, limit: usize) -> Result<Vec<ImportJobRecord>, String> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
         self.with_conn(|conn| {
-            conn.execute(
-                "UPDATE import_jobs SET status = ?2, updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
-                params![job_id, status_to_wire(status)],
+            let mut stmt = conn.prepare(
+                r#"
+                SELECT id
+                FROM import_jobs
+                WHERE status = 'queued'
+                ORDER BY id ASC
+                LIMIT ?1
+                "#,
             )?;
-            Ok(())
+            let ids: Vec<i64> = stmt
+                .query_map(params![limit as i64], |row| row.get::<_, i64>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+
+            if ids.is_empty() {
+                return Ok(Vec::new());
+            }
+
+            let mut records = Vec::with_capacity(ids.len());
+            let mut touched_batches = Vec::new();
+
+            for id in ids {
+                let updated = conn.execute(
+                    r#"
+                    UPDATE import_jobs
+                    SET status = ?2,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?1 AND status = 'queued'
+                    "#,
+                    params![id, status_to_wire(ImportJobStatus::Copying)],
+                )?;
+                if updated == 0 {
+                    continue;
+                }
+
+                let record = query_job_record(conn, id)?;
+                touched_batches.push(record.batch_id);
+                records.push(record);
+            }
+
+            touched_batches.sort_unstable();
+            touched_batches.dedup();
+            for batch_id in touched_batches {
+                recompute_batch_inner(conn, batch_id)?;
+            }
+
+            Ok(records)
         })
+        .map_err(|err| err.to_string())
     }
 
-    pub fn recover_stale_jobs(&self) -> rusqlite::Result<()> {
+    pub fn mark_job_stage(&self, id: i64, status: ImportJobStatus) -> Result<(), String> {
+        self.with_conn(|conn| {
+            let updated = conn.execute(
+                "UPDATE import_jobs SET status = ?2, updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
+                params![id, status_to_wire(status)],
+            )?;
+            if updated == 0 {
+                return Err(rusqlite::Error::QueryReturnedNoRows);
+            }
+            let batch_id = job_batch_id(conn, id)?;
+            recompute_batch_inner(conn, batch_id)
+        })
+        .map_err(|err| err.to_string())
+    }
+
+    pub fn mark_job_completed(&self, id: i64, files_written_json: &str) -> Result<(), String> {
+        self.with_conn(|conn| {
+            let updated = conn.execute(
+                r#"
+                UPDATE import_jobs
+                SET status = 'completed',
+                    files_written_json = ?2,
+                    next_retry_at = NULL,
+                    last_error = NULL,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?1
+                "#,
+                params![id, files_written_json],
+            )?;
+            if updated == 0 {
+                return Err(rusqlite::Error::QueryReturnedNoRows);
+            }
+            let batch_id = job_batch_id(conn, id)?;
+            recompute_batch_inner(conn, batch_id)
+        })
+        .map_err(|err| err.to_string())
+    }
+
+    pub fn mark_job_retry(
+        &self,
+        id: i64,
+        attempt_count: i64,
+        next_retry_at: &str,
+        last_error: &str,
+    ) -> Result<(), String> {
+        self.with_conn(|conn| {
+            let updated = conn.execute(
+                r#"
+                UPDATE import_jobs
+                SET status = 'retry_wait',
+                    attempt_count = ?2,
+                    next_retry_at = ?3,
+                    last_error = ?4,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?1
+                "#,
+                params![id, attempt_count, next_retry_at, last_error],
+            )?;
+            if updated == 0 {
+                return Err(rusqlite::Error::QueryReturnedNoRows);
+            }
+            let batch_id = job_batch_id(conn, id)?;
+            recompute_batch_inner(conn, batch_id)
+        })
+        .map_err(|err| err.to_string())
+    }
+
+    pub fn mark_job_failed(&self, id: i64, last_error: &str) -> Result<(), String> {
+        self.with_conn(|conn| {
+            let updated = conn.execute(
+                r#"
+                UPDATE import_jobs
+                SET status = 'failed',
+                    next_retry_at = NULL,
+                    last_error = ?2,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?1
+                "#,
+                params![id, last_error],
+            )?;
+            if updated == 0 {
+                return Err(rusqlite::Error::QueryReturnedNoRows);
+            }
+            let batch_id = job_batch_id(conn, id)?;
+            recompute_batch_inner(conn, batch_id)
+        })
+        .map_err(|err| err.to_string())
+    }
+
+    pub fn recover_stale_jobs(&self) -> Result<(), String> {
         self.with_conn(|conn| {
             conn.execute(
                 r#"
@@ -132,48 +276,80 @@ impl ImportQueueDb {
                 "#,
                 [],
             )?;
+
+            let mut stmt = conn.prepare("SELECT id FROM import_batches ORDER BY id ASC")?;
+            let batch_ids: Vec<i64> = stmt
+                .query_map([], |row| row.get::<_, i64>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            for batch_id in batch_ids {
+                recompute_batch_inner(conn, batch_id)?;
+            }
+
             Ok(())
         })
+        .map_err(|err| err.to_string())
     }
 
-    pub fn get_job(&self, job_id: i64) -> rusqlite::Result<ImportJobRecord> {
+    pub fn global_summary(&self, max_concurrency: usize) -> Result<ImportBatchSummary, String> {
         self.with_conn(|conn| {
-            conn.query_row(
+            let active_batches = conn.query_row(
+                "SELECT COUNT(*) FROM import_batches WHERE status IN ('queued', 'running')",
+                [],
+                |row| row.get::<_, i64>(0),
+            )?;
+
+            let (total_jobs, queued_jobs, running_jobs, retrying_jobs, completed_jobs, failed_jobs): (
+                i64,
+                i64,
+                i64,
+                i64,
+                i64,
+                i64,
+            ) = conn.query_row(
                 r#"
                 SELECT
-                    id,
-                    batch_id,
-                    source_path,
-                    source_name,
-                    dest_path,
-                    status,
-                    attempt_count
+                    COUNT(*) AS total_jobs,
+                    COALESCE(SUM(CASE WHEN status = 'queued' THEN 1 ELSE 0 END), 0) AS queued_jobs,
+                    COALESCE(SUM(CASE WHEN status IN ('copying', 'preprocessing', 'ingesting') THEN 1 ELSE 0 END), 0) AS running_jobs,
+                    COALESCE(SUM(CASE WHEN status = 'retry_wait' THEN 1 ELSE 0 END), 0) AS retrying_jobs,
+                    COALESCE(SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END), 0) AS completed_jobs,
+                    COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0) AS failed_jobs
                 FROM import_jobs
-                WHERE id = ?1
                 "#,
-                params![job_id],
+                [],
                 |row| {
-                    let status_raw: String = row.get(5)?;
-                    let status = ImportJobStatus::from_wire(&status_raw).map_err(|err| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            5,
-                            Type::Text,
-                            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, err)),
-                        )
-                    })?;
-
-                    Ok(ImportJobRecord {
-                        id: row.get(0)?,
-                        batch_id: row.get(1)?,
-                        source_path: row.get(2)?,
-                        source_name: row.get(3)?,
-                        dest_path: row.get(4)?,
-                        status,
-                        attempt_count: row.get(6)?,
-                    })
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
                 },
-            )
+            )?;
+
+            let mut summary = ImportBatchSummary {
+                active_batches,
+                total_jobs,
+                queued_jobs,
+                running_jobs,
+                retrying_jobs,
+                completed_jobs,
+                failed_jobs,
+                is_idle: queued_jobs + running_jobs + retrying_jobs == 0,
+                headline: String::new(),
+                max_concurrency,
+            };
+            summary.headline = build_headline(&summary);
+            Ok(summary)
         })
+        .map_err(|err| err.to_string())
+    }
+
+    pub fn get_job(&self, job_id: i64) -> Result<ImportJobRecord, String> {
+        self.with_conn(|conn| query_job_record(conn, job_id))
+            .map_err(|err| err.to_string())
     }
 
     fn with_conn<T>(
@@ -198,6 +374,123 @@ fn status_to_wire(status: ImportJobStatus) -> &'static str {
         ImportJobStatus::Completed => "completed",
         ImportJobStatus::Failed => "failed",
     }
+}
+
+fn query_job_record(conn: &Connection, job_id: i64) -> rusqlite::Result<ImportJobRecord> {
+    conn.query_row(
+        r#"
+        SELECT
+            id,
+            batch_id,
+            source_path,
+            source_name,
+            dest_path,
+            status,
+            attempt_count
+        FROM import_jobs
+        WHERE id = ?1
+        "#,
+        params![job_id],
+        |row| {
+            let status_raw: String = row.get(5)?;
+            let status = ImportJobStatus::from_wire(&status_raw).map_err(|err| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    5,
+                    Type::Text,
+                    Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, err)),
+                )
+            })?;
+
+            Ok(ImportJobRecord {
+                id: row.get(0)?,
+                batch_id: row.get(1)?,
+                source_path: row.get(2)?,
+                source_name: row.get(3)?,
+                dest_path: row.get(4)?,
+                status,
+                attempt_count: row.get(6)?,
+            })
+        },
+    )
+}
+
+fn job_batch_id(conn: &Connection, job_id: i64) -> rusqlite::Result<i64> {
+    conn.query_row(
+        "SELECT batch_id FROM import_jobs WHERE id = ?1",
+        params![job_id],
+        |row| row.get::<_, i64>(0),
+    )
+}
+
+fn recompute_batch_inner(conn: &Connection, batch_id: i64) -> rusqlite::Result<()> {
+    let (total_jobs, queued_jobs, running_jobs, retrying_jobs, completed_jobs, failed_jobs): (
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+    ) = conn.query_row(
+        r#"
+        SELECT
+            COUNT(*) AS total_jobs,
+            COALESCE(SUM(CASE WHEN status = 'queued' THEN 1 ELSE 0 END), 0) AS queued_jobs,
+            COALESCE(SUM(CASE WHEN status IN ('copying', 'preprocessing', 'ingesting') THEN 1 ELSE 0 END), 0) AS running_jobs,
+            COALESCE(SUM(CASE WHEN status = 'retry_wait' THEN 1 ELSE 0 END), 0) AS retrying_jobs,
+            COALESCE(SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END), 0) AS completed_jobs,
+            COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0) AS failed_jobs
+        FROM import_jobs
+        WHERE batch_id = ?1
+        "#,
+        params![batch_id],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+            ))
+        },
+    )?;
+
+    let status = if total_jobs == 0 || queued_jobs > 0 {
+        "queued"
+    } else if running_jobs > 0 || retrying_jobs > 0 {
+        "running"
+    } else if failed_jobs > 0 {
+        "failed"
+    } else if completed_jobs == total_jobs {
+        "completed"
+    } else {
+        "running"
+    };
+
+    conn.execute(
+        r#"
+        UPDATE import_batches
+        SET status = ?2,
+            total_jobs = ?3,
+            queued_jobs = ?4,
+            running_jobs = ?5,
+            completed_jobs = ?6,
+            failed_jobs = ?7,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?1
+        "#,
+        params![
+            batch_id,
+            status,
+            total_jobs,
+            queued_jobs,
+            running_jobs,
+            completed_jobs,
+            failed_jobs
+        ],
+    )?;
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -248,5 +541,50 @@ mod tests {
 
         let job = reopened.get_job(job_id).unwrap();
         assert_eq!(job.status, ImportJobStatus::Queued);
+    }
+
+    #[test]
+    fn create_batch_populates_summary_counts() {
+        let db = ImportQueueDb::open(temp_db_path("summary")).unwrap();
+        let batch_id = db.insert_batch("/tmp/folder").unwrap();
+        db.insert_job(NewImportJob {
+            batch_id,
+            source_path: "/tmp/folder/a.md".into(),
+            source_name: "a.md".into(),
+            dest_path: "/tmp/project/raw/sources/a.md".into(),
+            max_attempts: 3,
+        })
+        .unwrap();
+
+        db.recompute_batch(batch_id).unwrap();
+        let summary = db.global_summary(5).unwrap();
+        assert_eq!(summary.active_batches, 1);
+        assert_eq!(summary.total_jobs, 1);
+        assert_eq!(summary.queued_jobs, 1);
+        assert_eq!(summary.max_concurrency, 5);
+        assert!(!summary.headline.is_empty());
+        assert!(!summary.is_idle);
+    }
+
+    #[test]
+    fn claim_next_jobs_respects_limit() {
+        let db = ImportQueueDb::open(temp_db_path("claim")).unwrap();
+        let batch_id = db.insert_batch("/tmp/folder").unwrap();
+        for name in ["a.md", "b.md", "c.md"] {
+            db.insert_job(NewImportJob {
+                batch_id,
+                source_path: format!("/tmp/folder/{name}"),
+                source_name: name.to_string(),
+                dest_path: format!("/tmp/project/raw/sources/{name}"),
+                max_attempts: 3,
+            })
+            .unwrap();
+        }
+
+        let claimed = db.claim_next_jobs(2).unwrap();
+        assert_eq!(claimed.len(), 2);
+        assert!(claimed
+            .iter()
+            .all(|job| job.status == ImportJobStatus::Copying));
     }
 }
