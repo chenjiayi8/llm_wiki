@@ -115,6 +115,9 @@ Additional ingest enhancements beyond the original:
 - **overview.md auto-update** — global summary page regenerated on every ingest to reflect the latest state of the wiki
 - **Guaranteed source summary** — fallback ensures a source summary page is always created, even if the LLM omits it
 - **Language-aware generation** — LLM responds in the user's configured language (English or Chinese)
+- **Persistent import queue** — file/folder imports are queued before processing, with one persisted batch record plus one persisted job per imported file
+- **Resume on launch** — unfinished import queue work is restored and resumed automatically on app startup
+- **Configurable import concurrency** — queue worker parallelism is controlled via `.env` (`IMPORT_MAX_CONCURRENCY`, default `5`)
 
 ### 4. Knowledge Graph with Relevance Model
 
@@ -361,9 +364,12 @@ Download from [Releases](https://github.com/nashsu/llm_wiki/releases):
 git clone https://github.com/nashsu/llm_wiki.git
 cd llm_wiki
 npm install
+cp .env.example .env
 npm run tauri dev      # Development
 npm run tauri build    # Production build
 ```
+
+`IMPORT_MAX_CONCURRENCY` in `.env` controls how many queued import jobs are processed in parallel (default: `5`).
 
 ### Chrome Extension
 
