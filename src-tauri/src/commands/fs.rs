@@ -1,5 +1,6 @@
 use std::fs;
 use std::io::Read as IoRead;
+use std::panic::{self, AssertUnwindSafe};
 use std::path::Path;
 
 use calamine::{Reader, open_workbook_auto, Data};
@@ -113,8 +114,29 @@ fn write_cache(original: &Path, text: &str) -> Result<(), String> {
 fn extract_pdf_text(path: &str) -> Result<String, String> {
     let bytes =
         fs::read(path).map_err(|e| format!("Failed to read PDF '{}': {}", path, e))?;
-    pdf_extract::extract_text_from_mem(&bytes)
-        .map_err(|e| format!("Failed to extract text from PDF '{}': {}", path, e))
+    extract_pdf_text_from_bytes(&bytes, path)
+}
+
+fn extract_pdf_text_from_bytes(bytes: &[u8], path: &str) -> Result<String, String> {
+    match panic::catch_unwind(AssertUnwindSafe(|| pdf_extract::extract_text_from_mem(bytes))) {
+        Ok(Ok(text)) => Ok(text),
+        Ok(Err(err)) => Err(format!("Failed to extract text from PDF '{}': {}", path, err)),
+        Err(payload) => Err(format!(
+            "Failed to extract text from PDF '{}': extractor panicked: {}",
+            path,
+            panic_payload_to_string(payload)
+        )),
+    }
+}
+
+fn panic_payload_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "unknown panic".to_string()
+    }
 }
 
 /// Extract text from Office Open XML formats, converting to Markdown.
@@ -831,4 +853,82 @@ fn collect_related_pages(dir: &Path, source_name: &str, results: &mut Vec<String
 pub fn create_directory(path: String) -> Result<(), String> {
     fs::create_dir_all(&path)
         .map_err(|e| format!("Failed to create directory '{}': {}", path, e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extract_pdf_text;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn extract_pdf_text_returns_error_instead_of_panicking_when_extgstate_is_missing() {
+        let path = write_pdf_fixture("missing-extgstate.pdf", missing_extgstate_pdf_bytes());
+        let path_str = path.to_string_lossy().to_string();
+
+        let result = std::panic::catch_unwind(|| extract_pdf_text(&path_str));
+
+        let extraction = result.expect("extract_pdf_text should not panic on malformed PDFs");
+        let error = extraction.expect_err("malformed PDFs should surface as extraction errors");
+        assert!(
+            error.contains("Failed to extract text from PDF") || error.contains("panicked"),
+            "unexpected error: {error}"
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    fn write_pdf_fixture(name: &str, bytes: Vec<u8>) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time went backwards")
+            .as_nanos();
+        path.push(format!("llm-wiki-{unique}-{name}"));
+        fs::write(&path, bytes).expect("failed to write fixture");
+        path
+    }
+
+    fn missing_extgstate_pdf_bytes() -> Vec<u8> {
+        let objects = [
+            "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n".to_string(),
+            "2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n".to_string(),
+            "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << /ProcSet [/PDF /Text] >> /Contents 4 0 R >>\nendobj\n".to_string(),
+            {
+                let content = "q\n/GS0 gs\nQ\n";
+                format!(
+                    "4 0 obj\n<< /Length {} >>\nstream\n{}endstream\nendobj\n",
+                    content.len(),
+                    content
+                )
+            },
+        ];
+
+        let header = "%PDF-1.4\n";
+        let mut parts = vec![header.to_string()];
+        let mut offsets = vec![0usize];
+        let mut current_offset = header.len();
+
+        for object in objects {
+            offsets.push(current_offset);
+            current_offset += object.len();
+            parts.push(object);
+        }
+
+        let xref_offset = current_offset;
+        parts.push("xref\n".to_string());
+        parts.push(format!("0 {}\n", offsets.len()));
+        parts.push("0000000000 65535 f \n".to_string());
+        for offset in offsets.iter().skip(1) {
+            parts.push(format!("{offset:010} 00000 n \n"));
+        }
+        parts.push("trailer\n".to_string());
+        parts.push(format!("<< /Size {} /Root 1 0 R >>\n", offsets.len()));
+        parts.push("startxref\n".to_string());
+        parts.push(format!("{xref_offset}\n"));
+        parts.push("%%EOF\n".to_string());
+
+        parts.concat().into_bytes()
+    }
 }

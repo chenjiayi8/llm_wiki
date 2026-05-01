@@ -37,5 +37,7 @@ docx-rs = "0.4.20"
 codegen-units = 1
 lto = true
 opt-level = "s"
-panic = "abort"
+# Keep unwind enabled so file-extraction panics from third-party parsers can be contained
+# and returned as recoverable errors instead of terminating the desktop app.
+panic = "unwind"
 strip = true
